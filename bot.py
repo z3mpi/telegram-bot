@@ -1,15 +1,23 @@
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from datetime import datetime
+import os
 import logging
+import sys
 import time
 import subprocess
-import sys
-from telegram.error import TimedOut, NetworkError
-import psycopg2
+from datetime import datetime
 from contextlib import contextmanager
+
+import psycopg2
 from dotenv import load_dotenv
-import os
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters
+)
+from telegram.error import TimedOut, NetworkError
 
 # Настройка логирования
 logging.basicConfig(
@@ -27,45 +35,59 @@ PING_INTERVAL = 300  # 5 минут
 LIB_UPDATE_INTERVAL = 86400  # 1 день
 WAITING_FINE_AMOUNT, WAITING_NEW_RATE, CONFIRM_RESET = range(3)
 
-class Database:
+class DatabaseManager:
+    """Класс для управления подключением к Supabase"""
+    
     @contextmanager
     def get_connection(self):
-        """Контекстный менеджер для подключения к Supabase"""
-        conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+        """Контекстный менеджер для подключения к БД"""
+        conn = None
         try:
+            conn = psycopg2.connect(os.getenv('DATABASE_URL'))
             yield conn
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка БД: {e}")
+            raise
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
-    def init_db(self):
-        """Инициализация таблицы (уже сделана в Supabase)"""
-        pass
+    def ensure_table_exists(self):
+        """Проверка существования таблицы"""
+        with self.get_connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    total_hours FLOAT DEFAULT 0,
+                    fine FLOAT DEFAULT 0,
+                    rate INTEGER DEFAULT %s,
+                    last_update DATE
+                )
+            """, (DEFAULT_RATE,))
+            conn.commit()
 
-class BotData:
+class BotDataManager:
+    """Класс для работы с данными бота"""
+    
     def __init__(self):
-        self.db = Database()
+        self.db = DatabaseManager()
+        self.db.ensure_table_exists()
         
     def get_user_data(self, user_id: int) -> dict:
-        """Получение данных пользователя из Supabase"""
+        """Получение данных пользователя"""
         with self.db.get_connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-            data = cur.fetchone()
-            if data:
+            if data := cur.fetchone():
                 return {
                     'total_hours': data[1],
                     'fine': data[2],
                     'rate': data[3],
                     'last_update': data[4]
                 }
-            return {
-                'total_hours': 0,
-                'fine': 0,
-                'rate': DEFAULT_RATE,
-                'last_update': datetime.now().strftime('%Y-%m-%d')
-            }
+            return self._get_default_data()
 
     def update_user_data(self, user_id: int, data: dict):
-        """Обновление данных пользователя в Supabase"""
+        """Обновление данных пользователя"""
         with self.db.get_connection() as conn, conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO users (user_id, total_hours, fine, rate, last_update)
@@ -80,13 +102,24 @@ class BotData:
                 data.get('total_hours', 0),
                 data.get('fine', 0),
                 data.get('rate', DEFAULT_RATE),
-                data.get('last_update', datetime.now().strftime('%Y-%m-%d'))
+                data.get('last_update', datetime.now().date())
             ))
             conn.commit()
 
-bot_data = BotData()
+    def _get_default_data(self) -> dict:
+        """Данные по умолчанию"""
+        return {
+            'total_hours': 0,
+            'fine': 0,
+            'rate': DEFAULT_RATE,
+            'last_update': datetime.now().date()
+        }
 
-def get_keyboard():
+# Инициализация менеджера данных
+data_manager = BotDataManager()
+
+def get_keyboard() -> ReplyKeyboardMarkup:
+    """Генерация клавиатуры"""
     return ReplyKeyboardMarkup([
         ["📊 Статистика"],
         ["💰 Аванс", "💵 Зарплата"],
@@ -94,63 +127,58 @@ def get_keyboard():
         ["🔄 Сброс статистики"]
     ], resize_keyboard=True)
 
-def calculate_work_hours(start_time: str, end_time: str) -> float:
+def calculate_work_hours(time_range: str) -> float:
+    """Расчет отработанных часов"""
     try:
-        start_h, start_m = map(int, start_time.split(':'))
-        end_h, end_m = map(int, end_time.split(':'))
+        start, end = time_range.split('-')
+        start_h, start_m = map(int, start.split(':'))
+        end_h, end_m = map(int, end.split(':'))
         
-        if end_h < start_h or (end_h == start_h and end_m < start_m):
+        if (end_h, end_m) < (start_h, start_m):
             end_h += 24
             
         total_minutes = (end_h * 60 + end_m) - (start_h * 60 + start_m)
         return round(total_minutes / 60, 2)
-    except Exception as e:
-        logger.error(f"Ошибка расчета времени: {e}")
-        return 0.0
+    except ValueError as e:
+        logger.error(f"Неверный формат времени: {e}")
+        raise ValueError("Некорректный формат времени. Пример: 09:30-18:45")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    user_data = bot_data.get_user_data(user_id)
-    
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик команды /start"""
     await update.message.reply_text(
         "🕒 Введите рабочее время в формате ЧЧ:ММ-ЧЧ:ММ",
         reply_markup=get_keyboard()
     )
     return ConversationHandler.END
 
-async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text in ["✅ Да, сбросить", "❌ Нет, отменить"]:
-        return ConversationHandler.END
-        
+async def handle_work_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка введенного времени работы"""
     user_id = update.message.from_user.id
-    user_data = bot_data.get_user_data(user_id)
     
     try:
-        start_time, end_time = update.message.text.split('-')
-        hours = calculate_work_hours(start_time, end_time)
-        
-        if hours <= 0:
-            raise ValueError("Некорректное время работы")
-        
+        hours = calculate_work_hours(update.message.text)
+        user_data = data_manager.get_user_data(user_id)
         user_data['total_hours'] += hours
-        user_data['last_update'] = datetime.now().strftime('%Y-%m-%d')
-        bot_data.update_user_data(user_id, user_data)
+        user_data['last_update'] = datetime.now().date()
+        
+        data_manager.update_user_data(user_id, user_data)
         
         await update.message.reply_text(
-            f"✅ Добавлено: {start_time}-{end_time}\n"
+            f"✅ Добавлено: {update.message.text}\n"
             f"🕒 Отработано: {hours:.2f} ч.\n"
-            f"📊 Всего за месяц: {user_data['total_hours']:.2f} ч.",
+            f"📊 Всего: {user_data['total_hours']:.2f} ч.",
             reply_markup=get_keyboard()
         )
-    except Exception as e:
-        logger.error(f"Ошибка обработки времени: {e}")
+    except ValueError as e:
         await update.message.reply_text(
-            "❌ Неверный формат времени. Пример: 09:30-18:45 или 22:00-02:30",
+            f"❌ Ошибка: {e}",
             reply_markup=get_keyboard()
         )
+    
     return ConversationHandler.END
 
-async def request_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reset_stats_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Подтверждение сброса статистики"""
     await update.message.reply_text(
         "⚠️ Вы уверены, что хотите сбросить статистику?",
         reply_markup=ReplyKeyboardMarkup(
@@ -160,136 +188,75 @@ async def request_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return CONFIRM_RESET
 
-async def confirm_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update.message.text == "✅ Да, сбросить":
-            user_id = update.message.from_user.id
-            bot_data.update_user_data(user_id, {
-                'total_hours': 0,
-                'fine': 0,
-                'rate': DEFAULT_RATE,
-                'last_update': datetime.now().strftime('%Y-%m-%d')
-            })
-            await update.message.reply_text(
-                "🔄 Статистика сброшена!",
-                reply_markup=get_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                "Сброс отменён",
-                reply_markup=get_keyboard()
-            )
-    except Exception as e:
-        logger.error(f"Ошибка подтверждения сброса: {e}")
-    finally:
-        return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Действие отменено",
-        reply_markup=get_keyboard()
-    )
+async def execute_stats_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Выполнение сброса статистики"""
+    if update.message.text == "✅ Да, сбросить":
+        user_id = update.message.from_user.id
+        data_manager.update_user_data(user_id, data_manager._get_default_data())
+        await update.message.reply_text("🔄 Статистика сброшена!", reply_markup=get_keyboard())
+    else:
+        await update.message.reply_text("Сброс отменён", reply_markup=get_keyboard())
     return ConversationHandler.END
 
-async def send_ping(context: ContextTypes.DEFAULT_TYPE):
+async def cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена операции"""
+    await update.message.reply_text("Действие отменено", reply_markup=get_keyboard())
+    return ConversationHandler.END
+
+async def maintain_connection(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Поддержание соединения"""
     try:
         await context.bot.get_me()
-        logger.debug("Ping успешно отправлен")
-        return True
+        logger.debug("Соединение с Telegram активно")
     except Exception as e:
-        logger.warning(f"Ошибка ping: {e}")
-        return False
+        logger.warning(f"Ошибка соединения: {e}")
 
-async def check_lib_updates():
+def setup_application() -> Application:
+    """Настройка и конфигурация приложения"""
+    # Проверка обязательных переменных
+    if not (token := os.getenv('TELEGRAM_TOKEN')):
+        logger.error("Не задан TELEGRAM_TOKEN!")
+        sys.exit(1)
+
+    app = Application.builder().token(token).build()
+    
+    # Инициализация фоновых задач
+    app.job_queue.run_repeating(maintain_connection, interval=PING_INTERVAL, first=10)
+    
+    # Настройка обработчиков
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🔄 Сброс статистики$"), reset_stats_confirmation)],
+        states={
+            CONFIRM_RESET: [MessageHandler(filters.Regex("^(✅ Да, сбросить|❌ Нет, отменить)$"), execute_stats_reset)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_operation)],
+    )
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_work_time))
+    
+    return app
+
+def main() -> None:
+    """Точка входа в приложение"""
     try:
-        logger.info("Проверка обновлений библиотек...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "python-telegram-bot"])
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении библиотек: {e}")
-        return False
-
-async def maintain_connection(context: ContextTypes.DEFAULT_TYPE):
-    await send_ping(context)
-    await check_lib_updates()
-
-async def init_jobs(application: Application):
-    try:
-        application.job_queue.run_repeating(
-            maintain_connection,
-            interval=PING_INTERVAL,
-            first=10
+        # Обновление зависимостей
+        subprocess.run([sys.executable, "-m", "pip", "install", "-U", "pip"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], check=True)
+        
+        app = setup_application()
+        
+        logger.info("Бот запущен и готов к работе")
+        app.run_polling(
+            poll_interval=5.0,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
         )
-        logger.info("Фоновые задачи инициализированы")
     except Exception as e:
-        logger.error(f"Ошибка инициализации задач: {e}")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    error = context.error
-    logger.error(msg="Ошибка в боте:", exc_info=error)
-    
-    if isinstance(error, (psycopg2.OperationalError, psycopg2.InterfaceError)):
-        logger.error("Ошибка подключения к Supabase")
-        if update and hasattr(update, 'message'):
-            await update.message.reply_text(
-                "⚠️ Ошибка подключения к базе данных. Попробуйте позже.",
-                reply_markup=get_keyboard()
-            )
-    elif isinstance(error, (TimedOut, NetworkError)):
-        logger.warning("Проблемы с соединением Telegram")
-    elif update and hasattr(update, 'message'):
-        try:
-            await update.message.reply_text(
-                "⚠️ Временная ошибка. Попробуйте еще раз.",
-                reply_markup=get_keyboard()
-            )
-        except:
-            pass
-
-def main():
-    TOKEN = os.getenv('7821553363:AAGCEbiQ29WkKe-XYyr_EL4eWZcwf-AWxGI')
-    
-    # Первоначальное обновление библиотек
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "python-telegram-bot"])
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении: {e}")
-
-    while True:
-        try:
-            app = Application.builder().token(TOKEN).build()
-            
-            # Инициализация фоновых задач
-            app.post_init = init_jobs
-            
-            # Обработчики команд
-            app.add_handler(CommandHandler("start", start))
-            
-            # Обработчик сброса статистики
-            reset_handler = ConversationHandler(
-                entry_points=[MessageHandler(filters.Regex("^🔄 Сброс статистики$"), request_reset)],
-                states={
-                    CONFIRM_RESET: [MessageHandler(filters.Regex("^(✅ Да, сбросить|❌ Нет, отменить)$"), confirm_reset)],
-                },
-                fallbacks=[CommandHandler("cancel", cancel)],
-            )
-            app.add_handler(reset_handler)
-            
-            # Обработчик времени работы
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
-            
-            # Обработчик ошибок
-            app.add_error_handler(error_handler)
-            
-            logger.info("Бот запускается...")
-            app.run_polling(
-                poll_interval=5.0,
-                drop_pending_updates=True
-            )
-        except Exception as e:
-            logger.error(f"Критическая ошибка: {e}. Перезапуск через 30 секунд...")
-            time.sleep(30)
+        logger.critical(f"Критическая ошибка: {e}")
+        time.sleep(30)
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
